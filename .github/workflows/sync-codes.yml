@@ -1,0 +1,26 @@
+name: Sync Zugangscodes (ChargeAutomation -> Notion)
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"   # alle 15 Minuten (UTC)
+  workflow_dispatch: {}       # zusätzlich jederzeit manuell startbar
+
+concurrency:
+  group: sync-codes
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - run: python scripts/sync_codes_ca_to_notion.py
+        env:
+          CA_CLIENT_ID: ${{ secrets.CA_CLIENT_ID }}
+          CA_CLIENT_SECRET: ${{ secrets.CA_CLIENT_SECRET }}
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_DB_CODES: ${{ secrets.NOTION_DB_CODES }}
