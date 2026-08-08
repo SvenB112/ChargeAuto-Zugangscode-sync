@@ -56,12 +56,39 @@ COL_ACTIVE = "Aktiv"
 # Die ID, die im ChargeAutomation-Webinterface in der Spalte "ID" steht
 # (entspricht external_id, NICHT der internen API-id)
 COL_EXTERNAL_ID = "ID in ChargeAutomation"
+# Nur nötig, wenn mehrere ChargeAutomation-Accounts synchronisiert werden
+COL_ACCOUNT = "Account"
 
 CHECKIN_DONE = "Abgeschlossen"
 CHECKIN_OPEN = "Ausstehend"
 
-CA_CLIENT_ID = os.environ["CA_CLIENT_ID"]
-CA_CLIENT_SECRET = os.environ["CA_CLIENT_SECRET"]
+def load_accounts() -> list[dict]:
+    """Liest die ChargeAutomation-Zugänge aus den Umgebungsvariablen.
+
+    Account 1:  CA_CLIENT_ID,   CA_CLIENT_SECRET,   optional CA_ACCOUNT_NAME
+    Account 2:  CA_CLIENT_ID_2, CA_CLIENT_SECRET_2, optional CA_ACCOUNT_NAME_2
+    ... bis Account 9. Es reicht, die Secrets anzulegen - der Rest passiert
+    automatisch.
+    """
+    accounts = []
+    for index in range(1, 10):
+        suffix = "" if index == 1 else f"_{index}"
+        client_id = os.environ.get(f"CA_CLIENT_ID{suffix}")
+        client_secret = os.environ.get(f"CA_CLIENT_SECRET{suffix}")
+        if not client_id or not client_secret:
+            continue
+        accounts.append({
+            "name": os.environ.get(f"CA_ACCOUNT_NAME{suffix}") or f"Account {index}",
+            "client_id": client_id,
+            "client_secret": client_secret,
+        })
+    if not accounts:
+        raise RuntimeError("Keine ChargeAutomation-Zugangsdaten gefunden "
+                           "(CA_CLIENT_ID / CA_CLIENT_SECRET fehlen).")
+    return accounts
+
+
+ACCOUNTS = load_accounts()
 NOTION_TOKEN = os.environ["NOTION_TOKEN"]
 NOTION_DB_CODES = normalize_notion_id(os.environ["NOTION_DB_CODES"])
 
@@ -76,13 +103,13 @@ NOTION_HEADERS = {
 # ChargeAutomation
 # --------------------------------------------------------------------------
 
-def ca_token() -> str:
+def ca_token(account: dict) -> str:
     resp = requests.post(
         f"{CA_BASE}/oauth/token",
         json={
             "grant_type": "client_credentials",
-            "client_id": CA_CLIENT_ID,
-            "client_secret": CA_CLIENT_SECRET,
+            "client_id": account["client_id"],
+            "client_secret": account["client_secret"],
         },
         timeout=30,
     )
@@ -260,8 +287,11 @@ def set_choice(schema: dict, props: dict, column: str, value: str) -> None:
 
 
 def build_properties(schema: dict, prop: dict, name: str, property_id: str, code: str,
-                     booking: dict | None, now_iso: str) -> dict:
+                     booking: dict | None, now_iso: str, account_name: str = "") -> dict:
     props: dict = {COL_NAME: title_value(name), COL_CODE: text_value(code)}
+
+    if COL_ACCOUNT in schema:
+        set_choice(schema, props, COL_ACCOUNT, account_name)
 
     is_active = str(prop.get("status")) == "1"
     if COL_ACTIVE in schema:
@@ -318,7 +348,7 @@ def build_properties(schema: dict, prop: dict, name: str, property_id: str, code
 
 
 COMPARED_COLUMNS = (COL_NAME, COL_CODE, COL_NEXT_CHECKIN, COL_GUEST,
-                    COL_CHECKIN_STATUS, COL_ACTIVE, COL_EXTERNAL_ID)
+                    COL_CHECKIN_STATUS, COL_ACTIVE, COL_EXTERNAL_ID, COL_ACCOUNT)
 
 
 def signature(props_source: dict, schema: dict) -> tuple:
@@ -341,12 +371,6 @@ def main() -> int:
     now = datetime.now(timezone.utc)
     now_iso = now.isoformat()
 
-    token = ca_token()
-    properties = ca_properties(token)
-    bookings = ca_all_bookings(token)
-    upcoming = next_booking_per_property(bookings, now)
-    print(f"Davon {len(upcoming)} Unterkünfte mit anstehender Buchung.")
-
     schema = notion_schema(NOTION_DB_CODES)
     for required in (COL_NAME, COL_PROPERTY_ID, COL_CODE):
         if required not in schema:
@@ -358,70 +382,103 @@ def main() -> int:
         if optional not in schema:
             print(f"Hinweis: Spalte {optional!r} fehlt - wird übersprungen.")
 
-    rows = notion_all_rows(NOTION_DB_CODES)
-    print(f"Notion: {len(rows)} bestehende Zeilen gefunden.")
+    multi_account = len(ACCOUNTS) > 1
+    if multi_account and COL_ACCOUNT not in schema:
+        print(f"FEHLER: Es sind {len(ACCOUNTS)} ChargeAutomation-Accounts konfiguriert, "
+              f"aber die Spalte {COL_ACCOUNT!r} fehlt in der Notion-Datenbank. "
+              f"Ohne sie könnten sich Property-IDs der Accounts überschneiden.", file=sys.stderr)
+        return 1
 
-    by_property_id: dict[str, dict] = {}
+    rows = notion_all_rows(NOTION_DB_CODES)
+    print(f"Notion: {len(rows)} bestehende Zeilen gefunden.\n")
+
+    # Abgleich über (Account, Property-ID). Zeilen ohne Account-Eintrag werden
+    # dem ersten Account zugeordnet - so passen bestehende Zeilen aus der Zeit
+    # vor der Mehr-Account-Unterstützung weiterhin.
+    default_account = ACCOUNTS[0]["name"]
+    by_key: dict[tuple[str, str], dict] = {}
     for row in rows:
-        pid = plain_text(row.get("properties", {}).get(COL_PROPERTY_ID)).strip()
-        if pid:
-            by_property_id[pid] = row
+        props = row.get("properties", {})
+        pid = plain_text(props.get(COL_PROPERTY_ID)).strip()
+        if not pid:
+            continue
+        acc = plain_text(props.get(COL_ACCOUNT)).strip() or default_account
+        by_key[(acc, pid)] = row
 
     created = updated = unchanged = errors = 0
 
-    for prop in properties:
-        pid = str(prop.get("id"))
-        name = prop.get("name") or f"Unterkunft {pid}"
-        code = prop.get("access_code") or ""
-        external_id = prop.get("external_id")
-        booking = upcoming.get(str(external_id)) if external_id else None
+    for account in ACCOUNTS:
+        acc_name = account["name"]
+        print(f"--- ChargeAutomation-Account: {acc_name} ---")
+        try:
+            token = ca_token(account)
+            properties = ca_properties(token)
+            bookings = ca_all_bookings(token)
+        except Exception as exc:  # noqa: BLE001 - ein Account soll den Rest nicht stoppen
+            errors += 1
+            print(f"  ! Account {acc_name} nicht abrufbar: {exc}", file=sys.stderr)
+            continue
 
-        payload = build_properties(schema, prop, name, pid, code, booking, now_iso)
-        existing = by_property_id.get(pid)
+        upcoming = next_booking_per_property(bookings, now)
+        print(f"Davon {len(upcoming)} Unterkünfte mit anstehender Buchung.")
 
-        if existing is None:
-            resp = requests.post(
-                f"{NOTION_BASE}/pages", headers=NOTION_HEADERS,
-                json={"parent": {"database_id": NOTION_DB_CODES}, "properties": payload}, timeout=30,
+        for prop in properties:
+            pid = str(prop.get("id"))
+            name = prop.get("name") or f"Unterkunft {pid}"
+            code = prop.get("access_code") or ""
+            external_id = prop.get("external_id")
+            booking = upcoming.get(str(external_id)) if external_id else None
+
+            payload = build_properties(schema, prop, name, pid, code, booking,
+                                       now_iso, acc_name)
+            existing = by_key.get((acc_name, pid))
+
+            if existing is None:
+                resp = requests.post(
+                    f"{NOTION_BASE}/pages", headers=NOTION_HEADERS,
+                    json={"parent": {"database_id": NOTION_DB_CODES}, "properties": payload},
+                    timeout=30,
+                )
+                if resp.status_code == 200:
+                    created += 1
+                    print(f"  + angelegt: {name} (id {pid})")
+                else:
+                    errors += 1
+                    print(f"  ! Anlegen fehlgeschlagen {name} ({pid}): "
+                          f"{resp.status_code} {resp.text[:250]}", file=sys.stderr)
+                continue
+
+            # Nur schreiben, wenn sich inhaltlich etwas geändert hat
+            before = signature(existing.get("properties", {}), schema)
+            after_source = {
+                COL_NAME: {"type": "title", "title": payload[COL_NAME]["title"]},
+                COL_CODE: {"type": "rich_text", "rich_text": payload[COL_CODE]["rich_text"]},
+            }
+            for col in (COL_NEXT_CHECKIN, COL_GUEST, COL_CHECKIN_STATUS,
+                        COL_ACTIVE, COL_EXTERNAL_ID, COL_ACCOUNT):
+                if col in payload:
+                    after_source[col] = {"type": schema[col]["type"], **payload[col]}
+            after = signature(after_source, schema)
+
+            if before == after:
+                unchanged += 1
+                continue
+
+            resp = requests.patch(
+                f"{NOTION_BASE}/pages/{existing['id']}", headers=NOTION_HEADERS,
+                json={"properties": payload}, timeout=30,
             )
             if resp.status_code == 200:
-                created += 1
-                print(f"  + angelegt: {name} (id {pid})")
+                updated += 1
+                print(f"  ~ aktualisiert: {name} (id {pid})")
             else:
                 errors += 1
-                print(f"  ! Anlegen fehlgeschlagen {name} ({pid}): {resp.status_code} {resp.text[:250]}",
-                      file=sys.stderr)
-            continue
+                print(f"  ! Update fehlgeschlagen {name} ({pid}): "
+                      f"{resp.status_code} {resp.text[:250]}", file=sys.stderr)
+        print()
 
-        # Nur schreiben, wenn sich inhaltlich etwas geändert hat
-        before = signature(existing.get("properties", {}), schema)
-        after_source = {
-            COL_NAME: {"type": "title", "title": payload[COL_NAME]["title"]},
-            COL_CODE: {"type": "rich_text", "rich_text": payload[COL_CODE]["rich_text"]},
-        }
-        for col in (COL_NEXT_CHECKIN, COL_GUEST, COL_CHECKIN_STATUS,
-                    COL_ACTIVE, COL_EXTERNAL_ID):
-            if col in payload:
-                after_source[col] = {"type": schema[col]["type"], **payload[col]}
-        after = signature(after_source, schema)
-
-        if before == after:
-            unchanged += 1
-            continue
-
-        resp = requests.patch(
-            f"{NOTION_BASE}/pages/{existing['id']}", headers=NOTION_HEADERS,
-            json={"properties": payload}, timeout=30,
-        )
-        if resp.status_code == 200:
-            updated += 1
-            print(f"  ~ aktualisiert: {name} (id {pid})")
-        else:
-            errors += 1
-            print(f"  ! Update fehlgeschlagen {name} ({pid}): {resp.status_code} {resp.text[:250]}",
-                  file=sys.stderr)
-
-    print(f"\nFertig. Neu: {created}, aktualisiert: {updated}, unverändert: {unchanged}, Fehler: {errors}")
+    print(f"Fertig. Neu: {created}, aktualisiert: {updated}, "
+          f"unverändert: {unchanged}, Fehler: {errors}")
     return 1 if errors else 0
 
 
