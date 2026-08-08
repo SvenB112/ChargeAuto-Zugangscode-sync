@@ -49,10 +49,13 @@ COL_PROPERTY_ID = "ChargeAutomation Property-ID"
 COL_CODE = "Zugangscode"
 COL_STATUS = "Sync-Status"
 COL_SYNCED_AT = "Letzte Synchronisierung"
-# neu:
 COL_NEXT_CHECKIN = "Nächster Check-in"
 COL_GUEST = "Gast"
 COL_CHECKIN_STATUS = "Online Check-in"
+COL_ACTIVE = "Aktiv"
+# Die ID, die im ChargeAutomation-Webinterface in der Spalte "ID" steht
+# (entspricht external_id, NICHT der internen API-id)
+COL_EXTERNAL_ID = "ID in ChargeAutomation"
 
 CHECKIN_DONE = "Abgeschlossen"
 CHECKIN_OPEN = "Ausstehend"
@@ -101,55 +104,64 @@ def ca_get(token: str, path: str, params: dict | None = None) -> dict:
     return resp.json()
 
 
-def ca_properties(token: str) -> list[dict]:
-    data = ca_get(token, "/property").get("data")
-    if not isinstance(data, list):
-        raise RuntimeError("Unerwartete Property-Antwort")
-    return data
+def ca_fetch_all(token: str, path: str, label: str, max_pages: int = 500) -> list[dict]:
+    """Holt ALLE Datensätze eines Listen-Endpunkts.
 
-
-def ca_all_bookings(token: str) -> list[dict]:
-    """Holt alle Buchungen. Die API-Doku nennt keine Pagination-Parameter,
-    deshalb werden gängige Varianten ausprobiert und automatisch erkannt,
-    welche greift. Duplikate werden über die Buchungs-ID entfernt."""
+    Die API liefert pro Aufruf nur eine begrenzte Anzahl (aktuell 25) und die
+    Doku nennt keine Pagination-Parameter. Deshalb werden gängige Varianten
+    ausprobiert und automatisch erkannt, welche greift. Duplikate werden über
+    die ID entfernt.
+    """
     collected: dict[str, dict] = {}
 
-    first = ca_get(token, "/bookings").get("data") or []
-    for b in first:
-        collected[str(b.get("id"))] = b
+    first = ca_get(token, path).get("data")
+    if not isinstance(first, list):
+        raise RuntimeError(f"Unerwartete Antwort von {path}")
+    for item in first:
+        collected[str(item.get("id"))] = item
     page_size = len(first)
-    print(f"Buchungen: erste Seite liefert {page_size} Einträge.")
+    print(f"{label}: erste Seite liefert {page_size} Einträge.")
 
     if page_size == 0:
         return []
 
     # Variante A: ?page=N
-    for page in range(2, 200):
-        batch = ca_get(token, "/bookings", {"page": page}).get("data") or []
-        new = [b for b in batch if str(b.get("id")) not in collected]
+    for page in range(2, max_pages):
+        batch = ca_get(token, path, {"page": page}).get("data") or []
+        new = [i for i in batch if str(i.get("id")) not in collected]
         if not new:
             break
-        for b in new:
-            collected[str(b.get("id"))] = b
+        for item in new:
+            collected[str(item.get("id"))] = item
     if len(collected) > page_size:
-        print(f"Pagination über ?page erkannt, insgesamt {len(collected)} Buchungen.")
+        print(f"{label}: Pagination über ?page erkannt, insgesamt {len(collected)}.")
         return list(collected.values())
 
-    # Variante B: ?offset=N&limit=100
-    for offset in range(page_size, 20000, page_size):
-        batch = ca_get(token, "/bookings", {"offset": offset, "limit": page_size}).get("data") or []
-        new = [b for b in batch if str(b.get("id")) not in collected]
+    # Variante B: ?offset=N&limit=<page_size>
+    for offset in range(page_size, page_size * max_pages, page_size):
+        batch = ca_get(token, path, {"offset": offset, "limit": page_size}).get("data") or []
+        new = [i for i in batch if str(i.get("id")) not in collected]
         if not new:
             break
-        for b in new:
-            collected[str(b.get("id"))] = b
+        for item in new:
+            collected[str(item.get("id"))] = item
     if len(collected) > page_size:
-        print(f"Pagination über ?offset erkannt, insgesamt {len(collected)} Buchungen.")
+        print(f"{label}: Pagination über ?offset erkannt, insgesamt {len(collected)}.")
         return list(collected.values())
 
-    print(f"WARNUNG: Keine Pagination erkannt - es liegen nur {len(collected)} Buchungen vor. "
-          f"Falls es in Wirklichkeit mehr gibt, fehlen ggf. aktuelle Buchungen.")
+    print(f"{label}: keine weiteren Seiten gefunden, insgesamt {len(collected)}.")
+    if len(collected) == page_size >= 25:
+        print("  Hinweis: Das ist exakt die Seitengröße - falls es in Wirklichkeit mehr "
+              "gibt, wird die Pagination hier nicht erkannt.")
     return list(collected.values())
+
+
+def ca_properties(token: str) -> list[dict]:
+    return ca_fetch_all(token, "/property", "Unterkünfte")
+
+
+def ca_all_bookings(token: str) -> list[dict]:
+    return ca_fetch_all(token, "/bookings", "Buchungen")
 
 
 def parse_dt(value: str | None) -> datetime | None:
@@ -247,9 +259,25 @@ def set_choice(schema: dict, props: dict, column: str, value: str) -> None:
         props[column] = text_value(value)
 
 
-def build_properties(schema: dict, name: str, property_id: str, code: str,
+def build_properties(schema: dict, prop: dict, name: str, property_id: str, code: str,
                      booking: dict | None, now_iso: str) -> dict:
     props: dict = {COL_NAME: title_value(name), COL_CODE: text_value(code)}
+
+    is_active = str(prop.get("status")) == "1"
+    if COL_ACTIVE in schema:
+        kind = schema[COL_ACTIVE].get("type")
+        if kind == "checkbox":
+            props[COL_ACTIVE] = {"checkbox": is_active}
+        else:
+            set_choice(schema, props, COL_ACTIVE, "Aktiv" if is_active else "Inaktiv")
+
+    if COL_EXTERNAL_ID in schema:
+        ext = prop.get("external_id")
+        ext_str = "" if ext in (None, "") else str(ext)
+        if schema[COL_EXTERNAL_ID].get("type") == "number":
+            props[COL_EXTERNAL_ID] = {"number": int(ext_str) if ext_str.isdigit() else None}
+        else:
+            props[COL_EXTERNAL_ID] = text_value(ext_str)
 
     if (schema.get(COL_PROPERTY_ID) or {}).get("type") == "number":
         props[COL_PROPERTY_ID] = {"number": int(property_id)}
@@ -289,13 +317,22 @@ def build_properties(schema: dict, name: str, property_id: str, code: str,
     return props
 
 
+COMPARED_COLUMNS = (COL_NAME, COL_CODE, COL_NEXT_CHECKIN, COL_GUEST,
+                    COL_CHECKIN_STATUS, COL_ACTIVE, COL_EXTERNAL_ID)
+
+
 def signature(props_source: dict, schema: dict) -> tuple:
     """Vergleichswert, um unnötige Notion-Updates zu vermeiden."""
-    return tuple(
-        plain_text(props_source.get(col))
-        for col in (COL_NAME, COL_CODE, COL_NEXT_CHECKIN, COL_GUEST, COL_CHECKIN_STATUS)
-        if col in schema or col in (COL_NAME, COL_CODE)
-    )
+    result = []
+    for col in COMPARED_COLUMNS:
+        if col not in schema and col not in (COL_NAME, COL_CODE):
+            continue
+        prop = props_source.get(col)
+        if prop and prop.get("type") == "checkbox":
+            result.append("x" if prop.get("checkbox") else "")
+        else:
+            result.append(plain_text(prop))
+    return tuple(result)
 
 
 # --------------------------------------------------------------------------
@@ -306,8 +343,6 @@ def main() -> int:
 
     token = ca_token()
     properties = ca_properties(token)
-    print(f"ChargeAutomation: {len(properties)} Unterkünfte geladen.")
-
     bookings = ca_all_bookings(token)
     upcoming = next_booking_per_property(bookings, now)
     print(f"Davon {len(upcoming)} Unterkünfte mit anstehender Buchung.")
@@ -318,7 +353,8 @@ def main() -> int:
             print(f"FEHLER: Spalte {required!r} fehlt in der Notion-Datenbank.", file=sys.stderr)
             print(f"Vorhandene Spalten: {list(schema)}", file=sys.stderr)
             return 1
-    for optional in (COL_NEXT_CHECKIN, COL_GUEST, COL_CHECKIN_STATUS):
+    for optional in (COL_NEXT_CHECKIN, COL_GUEST, COL_CHECKIN_STATUS,
+                     COL_ACTIVE, COL_EXTERNAL_ID):
         if optional not in schema:
             print(f"Hinweis: Spalte {optional!r} fehlt - wird übersprungen.")
 
@@ -340,7 +376,7 @@ def main() -> int:
         external_id = prop.get("external_id")
         booking = upcoming.get(str(external_id)) if external_id else None
 
-        payload = build_properties(schema, name, pid, code, booking, now_iso)
+        payload = build_properties(schema, prop, name, pid, code, booking, now_iso)
         existing = by_property_id.get(pid)
 
         if existing is None:
@@ -363,7 +399,8 @@ def main() -> int:
             COL_NAME: {"type": "title", "title": payload[COL_NAME]["title"]},
             COL_CODE: {"type": "rich_text", "rich_text": payload[COL_CODE]["rich_text"]},
         }
-        for col in (COL_NEXT_CHECKIN, COL_GUEST, COL_CHECKIN_STATUS):
+        for col in (COL_NEXT_CHECKIN, COL_GUEST, COL_CHECKIN_STATUS,
+                    COL_ACTIVE, COL_EXTERNAL_ID):
             if col in payload:
                 after_source[col] = {"type": schema[col]["type"], **payload[col]}
         after = signature(after_source, schema)
