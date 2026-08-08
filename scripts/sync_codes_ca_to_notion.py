@@ -17,10 +17,27 @@ Benötigte Umgebungsvariablen:
 from __future__ import annotations
 
 import os
+import re
 import sys
 from datetime import datetime, timezone
 
 import requests
+
+
+def normalize_notion_id(raw: str) -> str:
+    """Akzeptiert rohe ID, ID mit Bindestrichen oder eine komplette Notion-URL
+    (auch mit ?v=... Ansichts-Parameter) und gibt die reine 32-stellige ID
+    zurück."""
+    value = (raw or "").strip()
+    value = value.split("?", 1)[0]          # Ansichts-Parameter abschneiden
+    value = value.rstrip("/").split("/")[-1]  # letzten Pfadteil nehmen
+    candidates = re.findall(r"[0-9a-fA-F]{32}", value.replace("-", ""))
+    if not candidates:
+        raise RuntimeError(
+            f"Konnte aus {raw!r} keine gültige Notion-Datenbank-ID lesen. "
+            "Erwartet werden 32 Hex-Zeichen, z.B. aus der Datenbank-URL."
+        )
+    return candidates[-1]
 
 CA_BASE = "https://api.chargeautomation.com/api/v1"
 NOTION_BASE = "https://api.notion.com/v1"
@@ -43,7 +60,7 @@ CHECKIN_OPEN = "Ausstehend"
 CA_CLIENT_ID = os.environ["CA_CLIENT_ID"]
 CA_CLIENT_SECRET = os.environ["CA_CLIENT_SECRET"]
 NOTION_TOKEN = os.environ["NOTION_TOKEN"]
-NOTION_DB_CODES = os.environ["NOTION_DB_CODES"]
+NOTION_DB_CODES = normalize_notion_id(os.environ["NOTION_DB_CODES"])
 
 NOTION_HEADERS = {
     "Authorization": f"Bearer {NOTION_TOKEN}",
