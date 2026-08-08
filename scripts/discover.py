@@ -1,8 +1,13 @@
 """
-Discovery-Skript, Runde 7: OAuth.
-Der Legacy-API-Key hat offenbar nur Lesezugriff. Jetzt mit den neuen
-OAuth-Credentials (Read+Write) einen Access-Token holen und den Schreibtest
-wiederholen - wieder als No-Op (gleicher Wert wie bisher).
+Discovery-Skript, Runde 8.
+OAuth funktioniert, property/update wird trotzdem abgelehnt.
+Jetzt: risikofreies Mapping, WELCHE Schreibrouten es überhaupt gibt.
+Es werden ausschließlich Fantasie-IDs (999999999) verwendet - damit kann
+garantiert kein echter Datensatz verändert werden. Interessant ist nur,
+WELCHE Fehlermeldung kommt:
+  "invalid id"        -> Route existiert, Schreiben grundsätzlich erlaubt
+  "not allowed"       -> Route existiert, Schreiben gesperrt
+  "Bad request"       -> Route existiert nicht
 """
 import json
 import os
@@ -12,77 +17,58 @@ import requests
 CLIENT_ID = os.environ["CA_CLIENT_ID"]
 CLIENT_SECRET = os.environ["CA_CLIENT_SECRET"]
 BASE = "https://api.chargeautomation.com/api/v1"
+TOKEN_URL = BASE + "/oauth/token"
 
-TEST_PROPERTY_ID = 82776  # "Hohlstein 32H?1", aktiv
+FAKE_ID = 999999999  # existiert garantiert nicht
 
 
-def dump(label: str, resp: requests.Response, limit: int = 2000) -> None:
-    print(f"\n===== {label}: HTTP {resp.status_code} =====")
+def get_token() -> str:
+    resp = requests.post(
+        TOKEN_URL,
+        json={
+            "grant_type": "client_credentials",
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+        },
+        timeout=15,
+    )
+    return resp.json()["data"]["access_token"]
+
+
+def probe(headers: dict, label: str, url: str, payload: dict) -> None:
     try:
-        text = json.dumps(resp.json(), indent=2, ensure_ascii=False)
+        resp = requests.post(url, headers=headers, json=payload, timeout=15)
+    except requests.RequestException as exc:
+        print(f"{label}: Fehler {exc}")
+        return
+    try:
+        body = json.dumps(resp.json(), ensure_ascii=False)
     except ValueError:
-        text = resp.text
-    print(text[:limit])
-
-
-def get_token() -> str | None:
-    """Token-Endpunkt suchen und Access-Token holen."""
-    candidates = [
-        "https://api.chargeautomation.com/oauth/token",
-        "https://api.chargeautomation.com/api/v1/oauth/token",
-        "https://api.chargeautomation.com/api/oauth/token",
-        "https://app.chargeautomation.com/oauth/token",
-    ]
-    payload = {
-        "grant_type": "client_credentials",
-        "client_id": CLIENT_ID,
-        "client_secret": CLIENT_SECRET,
-    }
-    for url in candidates:
-        for as_json in (True, False):
-            try:
-                if as_json:
-                    resp = requests.post(url, json=payload, timeout=15)
-                else:
-                    resp = requests.post(url, data=payload, timeout=15)
-            except requests.RequestException as exc:
-                print(f"{url} ({'json' if as_json else 'form'}) fehlgeschlagen: {exc}")
-                continue
-            dump(f"TOKEN-VERSUCH {url} ({'json' if as_json else 'form'})", resp)
-            try:
-                data = resp.json()
-            except ValueError:
-                continue
-            token = (
-                data.get("access_token")
-                or (data.get("data") or {}).get("access_token")
-                if isinstance(data.get("data"), dict) else data.get("access_token")
-            )
-            if token:
-                print(f"\n>>> TOKEN ERHALTEN via {url} ({'json' if as_json else 'form'})")
-                return token
-    return None
+        body = resp.text[:200]
+    print(f"{label}\n    -> {body}\n")
 
 
 if __name__ == "__main__":
     token = get_token()
-    if not token:
-        print("\n!!! Kein Token erhalten - Token-Endpunkt noch unbekannt.")
-        raise SystemExit(0)
-
     headers = {"Authorization": f"Bearer {token}"}
+    print(f"Token OK.\n")
 
-    resp = requests.get(BASE + "/property", headers=headers, params={"id": TEST_PROPERTY_ID}, timeout=15)
-    dump(f"VORHER: GET /property?id={TEST_PROPERTY_ID}", resp)
-    current = resp.json().get("data", {})
+    print("=== SCHREIBROUTEN-MAPPING (nur Fantasie-IDs, kein echter Datensatz) ===\n")
 
-    resp = requests.post(
-        BASE + "/property/update",
-        headers=headers,
-        json={"id": TEST_PROPERTY_ID, "access_code": current.get("access_code", "")},
-        timeout=15,
-    )
-    dump("UPDATE (No-Op) mit OAuth-Token", resp)
+    probe(headers, "POST /property/update (fake id)",
+          BASE + "/property/update", {"id": FAKE_ID, "access_code": "X"})
 
-    resp = requests.get(BASE + "/property", headers=headers, params={"id": TEST_PROPERTY_ID}, timeout=15)
-    dump(f"NACHHER: GET /property?id={TEST_PROPERTY_ID}", resp)
+    probe(headers, "POST /property/update (fake id, wifi statt access_code)",
+          BASE + "/property/update", {"id": FAKE_ID, "wifi_details": "X"})
+
+    probe(headers, "POST /booking/update (fake id)",
+          BASE + "/booking/update", {"id": FAKE_ID, "booking_access_code": "X"})
+
+    probe(headers, "POST /booking/update (fake booking_id)",
+          BASE + "/booking/update", {"booking_id": FAKE_ID, "booking_access_code": "X"})
+
+    probe(headers, "POST /rental/update (fake id)",
+          BASE + "/rental/update", {"id": FAKE_ID, "access_code": "X"})
+
+    probe(headers, "POST /property/delete (fake id) - nur Routen-Check",
+          BASE + "/property/delete", {"id": FAKE_ID})
