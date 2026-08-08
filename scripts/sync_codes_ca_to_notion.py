@@ -208,16 +208,39 @@ def parse_dt(value: str | None) -> datetime | None:
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
+# In ChargeAutomation bedeutet status=1 "aktiv" und status=0 "storniert"
+# (verifiziert an Buchung 144666626, die im Webinterface als "Cancelled"
+# geführt wird und status=0 hat).
+STATUS_ACTIVE = "1"
+
+
 def next_booking_per_property(bookings: list[dict], now: datetime) -> dict[str, dict]:
-    """Ordnet jeder booking.property_id die zeitlich nächste künftige Buchung zu."""
+    """Ordnet jeder booking.property_id die zeitlich nächste künftige Buchung zu.
+    Stornierte Buchungen werden übersprungen."""
     best: dict[str, tuple[datetime, dict]] = {}
+    skipped: list[dict] = []
+
     for b in bookings:
         checkin = parse_dt(b.get("check_in"))
         if checkin is None or checkin < now:
             continue
+        if str(b.get("status")) != STATUS_ACTIVE:
+            skipped.append(b)
+            continue
         key = str(b.get("property_id"))
         if key not in best or checkin < best[key][0]:
             best[key] = (checkin, b)
+
+    if skipped:
+        print(f"  {len(skipped)} anstehende Buchung(en) als storniert übersprungen:")
+        for b in sorted(skipped, key=lambda x: x.get("check_in") or "")[:10]:
+            name = f"{b.get('guest_first_name') or ''} {b.get('guest_last_name') or ''}".strip()
+            checkin = parse_dt(b.get("check_in"))
+            print(f"    - {checkin.strftime('%d.%m.%Y') if checkin else '?'}  "
+                  f"{name or '(ohne Namen)'}  (id {b.get('id')}, status {b.get('status')!r})")
+        if len(skipped) > 10:
+            print(f"    ... und {len(skipped) - 10} weitere")
+
     return {key: value[1] for key, value in best.items()}
 
 
