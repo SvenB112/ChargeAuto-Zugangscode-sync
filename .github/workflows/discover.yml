@@ -15,3 +15,5 @@ jobs:
       - run: python scripts/discover.py
         env:
           CHARGEAUTOMATION_API_KEY: ${{ secrets.CHARGEAUTOMATION_API_KEY }}
+          CA_CLIENT_ID: ${{ secrets.CA_CLIENT_ID }}
+          CA_CLIENT_SECRET: ${{ secrets.CA_CLIENT_SECRET }}
