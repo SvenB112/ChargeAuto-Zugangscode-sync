@@ -51,6 +51,7 @@ COL_STATUS = "Sync-Status"
 COL_SYNCED_AT = "Letzte Synchronisierung"
 COL_NEXT_CHECKIN = "Nächster Check-in"
 COL_GUEST = "Gast"
+COL_PHONE = "Telefon"
 COL_CHECKIN_STATUS = "Online Check-in"
 COL_ACTIVE = "Aktiv"
 # Die ID, die im ChargeAutomation-Webinterface in der Spalte "ID" steht
@@ -90,6 +91,12 @@ def load_accounts() -> list[dict]:
 
 ACCOUNTS = load_accounts()
 NOTION_TOKEN = os.environ["NOTION_TOKEN"]
+
+# Zeitstempel bei JEDEM Lauf schreiben, auch wenn sich inhaltlich nichts
+# geändert hat. So sieht man in Notion, dass der Sync läuft.
+# Mit ALWAYS_TOUCH=false abschaltbar (dann bleibt "Letzte Synchronisierung"
+# beim Stand der letzten echten Änderung stehen).
+ALWAYS_TOUCH = os.environ.get("ALWAYS_TOUCH", "true").strip().lower() not in ("false", "0", "no")
 NOTION_DB_CODES = normalize_notion_id(os.environ["NOTION_DB_CODES"])
 
 NOTION_HEADERS = {
@@ -259,6 +266,11 @@ def plain_text(prop: dict | None) -> str:
     if kind == "select":
         sel = prop.get("select")
         return (sel or {}).get("name", "")
+    if kind == "status":
+        sel = prop.get("status")
+        return (sel or {}).get("name", "")
+    if kind in ("phone_number", "email", "url"):
+        return prop.get(kind) or ""
     if kind == "date":
         return ((prop.get("date") or {}).get("start") or "")
     return ""
@@ -337,6 +349,22 @@ def build_properties(schema: dict, prop: dict, name: str, property_id: str, code
     if COL_GUEST in schema:
         props[COL_GUEST] = text_value(guest)
 
+    if COL_PHONE in schema:
+        phone = ""
+        if booking:
+            info = booking.get("guest_info") or {}
+            # Reihenfolge: bestbefülltes Feld zuerst
+            for candidate in (booking.get("guest_mobile"), booking.get("guest_phone"),
+                              info.get("phone_number")):
+                if candidate:
+                    phone = str(candidate).strip()
+                    break
+        kind = schema[COL_PHONE].get("type")
+        if kind == "phone_number":
+            props[COL_PHONE] = {"phone_number": phone or None}
+        else:
+            props[COL_PHONE] = text_value(phone)
+
     if COL_CHECKIN_STATUS in schema:
         if booking is None:
             status_value = ""
@@ -347,7 +375,7 @@ def build_properties(schema: dict, prop: dict, name: str, property_id: str, code
     return props
 
 
-COMPARED_COLUMNS = (COL_NAME, COL_CODE, COL_NEXT_CHECKIN, COL_GUEST,
+COMPARED_COLUMNS = (COL_NAME, COL_CODE, COL_NEXT_CHECKIN, COL_GUEST, COL_PHONE,
                     COL_CHECKIN_STATUS, COL_ACTIVE, COL_EXTERNAL_ID, COL_ACCOUNT)
 
 
@@ -377,7 +405,7 @@ def main() -> int:
             print(f"FEHLER: Spalte {required!r} fehlt in der Notion-Datenbank.", file=sys.stderr)
             print(f"Vorhandene Spalten: {list(schema)}", file=sys.stderr)
             return 1
-    for optional in (COL_NEXT_CHECKIN, COL_GUEST, COL_CHECKIN_STATUS,
+    for optional in (COL_NEXT_CHECKIN, COL_GUEST, COL_PHONE, COL_CHECKIN_STATUS,
                      COL_ACTIVE, COL_EXTERNAL_ID):
         if optional not in schema:
             print(f"Hinweis: Spalte {optional!r} fehlt - wird übersprungen.")
@@ -454,7 +482,7 @@ def main() -> int:
                 COL_NAME: {"type": "title", "title": payload[COL_NAME]["title"]},
                 COL_CODE: {"type": "rich_text", "rich_text": payload[COL_CODE]["rich_text"]},
             }
-            for col in (COL_NEXT_CHECKIN, COL_GUEST, COL_CHECKIN_STATUS,
+            for col in (COL_NEXT_CHECKIN, COL_GUEST, COL_PHONE, COL_CHECKIN_STATUS,
                         COL_ACTIVE, COL_EXTERNAL_ID, COL_ACCOUNT):
                 if col in payload:
                     after_source[col] = {"type": schema[col]["type"], **payload[col]}
@@ -462,6 +490,17 @@ def main() -> int:
 
             if before == after:
                 unchanged += 1
+                # Nichts geändert: optional nur den Zeitstempel auffrischen,
+                # damit in Notion sichtbar ist, dass der Sync gelaufen ist.
+                if ALWAYS_TOUCH and COL_SYNCED_AT in payload:
+                    touch = requests.patch(
+                        f"{NOTION_BASE}/pages/{existing['id']}", headers=NOTION_HEADERS,
+                        json={"properties": {COL_SYNCED_AT: payload[COL_SYNCED_AT]}}, timeout=30,
+                    )
+                    if touch.status_code != 200:
+                        errors += 1
+                        print(f"  ! Zeitstempel fehlgeschlagen {name} ({pid}): "
+                              f"{touch.status_code} {touch.text[:200]}", file=sys.stderr)
                 continue
 
             resp = requests.patch(
@@ -477,8 +516,10 @@ def main() -> int:
                       f"{resp.status_code} {resp.text[:250]}", file=sys.stderr)
         print()
 
-    print(f"Fertig. Neu: {created}, aktualisiert: {updated}, "
-          f"unverändert: {unchanged}, Fehler: {errors}")
+    touched = " (Zeitstempel aufgefrischt)" if ALWAYS_TOUCH else ""
+    print(f"Fertig um {now.strftime('%d.%m.%Y %H:%M')} UTC. "
+          f"Neu: {created}, aktualisiert: {updated}, "
+          f"unverändert: {unchanged}{touched}, Fehler: {errors}")
     return 1 if errors else 0
 
 
