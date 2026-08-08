@@ -20,7 +20,18 @@ jobs:
       - run: pip install -r requirements.txt
       - run: python scripts/sync_codes_ca_to_notion.py
         env:
+          # --- ChargeAutomation Account 1 ---
           CA_CLIENT_ID: ${{ secrets.CA_CLIENT_ID }}
           CA_CLIENT_SECRET: ${{ secrets.CA_CLIENT_SECRET }}
+          CA_ACCOUNT_NAME: ${{ secrets.CA_ACCOUNT_NAME }}
+          # --- ChargeAutomation Account 2 (optional) ---
+          CA_CLIENT_ID_2: ${{ secrets.CA_CLIENT_ID_2 }}
+          CA_CLIENT_SECRET_2: ${{ secrets.CA_CLIENT_SECRET_2 }}
+          CA_ACCOUNT_NAME_2: ${{ secrets.CA_ACCOUNT_NAME_2 }}
+          # --- ChargeAutomation Account 3 (optional) ---
+          CA_CLIENT_ID_3: ${{ secrets.CA_CLIENT_ID_3 }}
+          CA_CLIENT_SECRET_3: ${{ secrets.CA_CLIENT_SECRET_3 }}
+          CA_ACCOUNT_NAME_3: ${{ secrets.CA_ACCOUNT_NAME_3 }}
+          # --- Notion ---
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           NOTION_DB_CODES: ${{ secrets.NOTION_DB_CODES }}
