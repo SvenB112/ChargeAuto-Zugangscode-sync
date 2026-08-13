@@ -20,6 +20,7 @@ import os
 import re
 import sys
 from datetime import datetime, timezone
+from html import unescape
 
 import requests
 
@@ -53,6 +54,8 @@ COL_NEXT_CHECKIN = "Nächster Check-in"
 COL_GUEST = "Gast"
 COL_PHONE = "Telefon"
 COL_CHECKIN_STATUS = "Online Check-in"
+COL_CHECKIN_LINK = "Check-in Link"
+COL_INSTRUCTIONS = "Check-in Anleitung"
 COL_ACTIVE = "Aktiv"
 # Die ID, die im ChargeAutomation-Webinterface in der Spalte "ID" steht
 # (entspricht external_id, NICHT der internen API-id)
@@ -300,7 +303,29 @@ def plain_text(prop: dict | None) -> str:
 
 
 def text_value(value: str) -> dict:
-    return {"rich_text": [{"type": "text", "text": {"content": value[:2000]}}]}
+    """Notion erlaubt max. 2000 Zeichen pro Text-Baustein - längere Texte
+    werden deshalb auf mehrere Bausteine aufgeteilt (max. 100)."""
+    if not value:
+        return {"rich_text": []}
+    chunks = [value[i:i + 2000] for i in range(0, len(value), 2000)][:100]
+    return {"rich_text": [{"type": "text", "text": {"content": c}} for c in chunks]}
+
+
+def html_to_text(html: str) -> str:
+    """Wandelt die HTML-Texte aus ChargeAutomation (property_text2 & Co.)
+    in lesbaren Fließtext um."""
+    if not html:
+        return ""
+    text = html
+    text = re.sub(r"<\s*br\s*/?\s*>", "\n", text, flags=re.I)
+    text = re.sub(r"<\s*/\s*(p|div|li|h[1-6])\s*>", "\n", text, flags=re.I)
+    text = re.sub(r"<\s*li[^>]*>", "• ", text, flags=re.I)
+    text = re.sub(r"<[^>]+>", "", text)          # restliche Tags entfernen
+    text = unescape(text)
+    text = text.replace("\xa0", " ")             # geschütztes Leerzeichen
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n\s*\n\s*\n+", "\n\n", text)  # max. eine Leerzeile
+    return text.strip()
 
 
 def title_value(value: str) -> dict:
@@ -335,6 +360,9 @@ def build_properties(schema: dict, prop: dict, name: str, property_id: str, code
             props[COL_ACTIVE] = {"checkbox": is_active}
         else:
             set_choice(schema, props, COL_ACTIVE, "Aktiv" if is_active else "Inaktiv")
+
+    if COL_INSTRUCTIONS in schema:
+        props[COL_INSTRUCTIONS] = text_value(html_to_text(prop.get("property_text2") or ""))
 
     if COL_EXTERNAL_ID in schema:
         ext = prop.get("external_id")
@@ -388,6 +416,16 @@ def build_properties(schema: dict, prop: dict, name: str, property_id: str, code
         else:
             props[COL_PHONE] = text_value(phone)
 
+    if COL_CHECKIN_LINK in schema:
+        link = ""
+        if booking:
+            link = ((booking.get("routes") or {}).get("pre_checkin") or "").strip()
+        kind = schema[COL_CHECKIN_LINK].get("type")
+        if kind == "url":
+            props[COL_CHECKIN_LINK] = {"url": link or None}
+        else:
+            props[COL_CHECKIN_LINK] = text_value(link)
+
     if COL_CHECKIN_STATUS in schema:
         if booking is None:
             status_value = ""
@@ -399,7 +437,8 @@ def build_properties(schema: dict, prop: dict, name: str, property_id: str, code
 
 
 COMPARED_COLUMNS = (COL_NAME, COL_CODE, COL_NEXT_CHECKIN, COL_GUEST, COL_PHONE,
-                    COL_CHECKIN_STATUS, COL_ACTIVE, COL_EXTERNAL_ID, COL_ACCOUNT)
+                    COL_CHECKIN_LINK, COL_INSTRUCTIONS, COL_CHECKIN_STATUS,
+                    COL_ACTIVE, COL_EXTERNAL_ID, COL_ACCOUNT)
 
 
 def signature(props_source: dict, schema: dict) -> tuple:
@@ -428,8 +467,8 @@ def main() -> int:
             print(f"FEHLER: Spalte {required!r} fehlt in der Notion-Datenbank.", file=sys.stderr)
             print(f"Vorhandene Spalten: {list(schema)}", file=sys.stderr)
             return 1
-    for optional in (COL_NEXT_CHECKIN, COL_GUEST, COL_PHONE, COL_CHECKIN_STATUS,
-                     COL_ACTIVE, COL_EXTERNAL_ID):
+    for optional in (COL_NEXT_CHECKIN, COL_GUEST, COL_PHONE, COL_CHECKIN_LINK,
+                     COL_INSTRUCTIONS, COL_CHECKIN_STATUS, COL_ACTIVE, COL_EXTERNAL_ID):
         if optional not in schema:
             print(f"Hinweis: Spalte {optional!r} fehlt - wird übersprungen.")
 
@@ -505,8 +544,9 @@ def main() -> int:
                 COL_NAME: {"type": "title", "title": payload[COL_NAME]["title"]},
                 COL_CODE: {"type": "rich_text", "rich_text": payload[COL_CODE]["rich_text"]},
             }
-            for col in (COL_NEXT_CHECKIN, COL_GUEST, COL_PHONE, COL_CHECKIN_STATUS,
-                        COL_ACTIVE, COL_EXTERNAL_ID, COL_ACCOUNT):
+            for col in (COL_NEXT_CHECKIN, COL_GUEST, COL_PHONE, COL_CHECKIN_LINK,
+                        COL_INSTRUCTIONS, COL_CHECKIN_STATUS, COL_ACTIVE,
+                        COL_EXTERNAL_ID, COL_ACCOUNT):
                 if col in payload:
                     after_source[col] = {"type": schema[col]["type"], **payload[col]}
             after = signature(after_source, schema)
